@@ -1,0 +1,8 @@
+<launch>
+  <node pkg="tf" type="static_transform_publisher" name="base_link_broadcaster" args="1 0 0 0 0 0 base_link link1 100" />
+  <node pkg="beginner_tutorials" type="talker" name="depth_camera" respawn="false"  required="true">
+    <remap from="/points2" to="/depth_registered/points" />
+  </node>
+  <node pkg="rviz" type="rviz" name="rviz" args="-d /home/scott/catkin_ws/src/beginner_tutorials/src/pointCloud2.rviz" respawn="false"  required="true">
+  </node>
+</launch>

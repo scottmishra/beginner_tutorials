@@ -1,0 +1,552 @@
+////////////////////////////////////////////////////////////////////////////////
+// SoftKinetic DepthSense SDK
+//
+// COPYRIGHT AND CONFIDENTIALITY NOTICE - SOFTKINETIC CONFIDENTIAL
+// INFORMATION
+//
+// All rights reserved to SOFTKINETIC SENSORS NV (a
+// company incorporated and existing under the laws of Belgium, with
+// its principal place of business at Boulevard de la Plainelaan 15,
+// 1050 Brussels (Belgium), registered with the Crossroads bank for
+// enterprises under company number 0811 341 454 - "Softkinetic
+// Sensors").
+//
+// The source code of the SoftKinetic DepthSense Camera Drivers is
+// proprietary and confidential information of Softkinetic Sensors NV.
+//
+// For any question about terms and conditions, please contact:
+// info@softkinetic.com Copyright (c) 2002-2012 Softkinetic Sensors NV
+////////////////////////////////////////////////////////////////////////////////
+
+
+#ifdef _MSC_VER
+#include <windows.h>
+#endif
+
+#include <stdio.h>
+#include <vector>
+#include <exception>
+#include <cmath>
+#include <algorithm>
+
+//ros include files
+#include <ros/ros.h>
+#include <sensor_msgs/PointCloud2.h>
+
+//pcl_ros include files
+#include <pcl_ros/point_cloud.h>
+#include <pcl_ros/io/pcd_io.h>
+#include <pcl_ros/transforms.h>
+
+//pcl include files
+#include <pcl/point_types.h>
+#include <pcl/range_image/range_image.h>
+#include <pcl/filters/passthrough.h>
+#include <pcl/segmentation/extract_clusters.h>
+#include <pcl/visualization/cloud_viewer.h>
+#include <pcl/segmentation/sac_segmentation.h>
+#include <pcl/segmentation/extract_clusters.h>
+
+//DepthSenseSDK include file
+#include <DepthSense.hxx>
+
+using namespace DepthSense;
+using namespace std;
+
+typedef pcl::PointCloud<pcl::PointXYZ> PointCloud;
+
+Context g_context;
+DepthNode g_dnode;
+ColorNode g_cnode;
+AudioNode g_anode;
+
+uint32_t g_aFrames = 0;
+uint32_t g_cFrames = 0;
+uint32_t g_dFrames = 0;
+
+bool g_bDeviceFound = false;
+
+ProjectionHelper* g_pProjHelper = NULL;
+StereoCameraParameters g_scp;
+
+ros::Publisher pub;
+PointCloud::Ptr msg (new PointCloud);
+pcl::PointCloud<pcl::PointXYZRGB> cloud;
+
+namespace point_cloud //Allowes one to specifiy which PointCloud to use
+{
+
+class PointCloud
+{
+private:
+
+  ros::NodeHandle nh_; //ros node handle
+  std::string action_name_;
+
+  ros::Subscriber point_cloud_sub_; //point cloud subscriber
+  ros::Publisher depth_pub_; // filtered point cloud for testing the algorithms
+  tf::TransformListener tf_listener_;
+
+  // Parameters of problem
+  std::string arm_link;
+  double min_cam_dist;
+  double max_cam_dist;
+
+public:
+  //consctuctor
+  PointCloud(const std::string name) :
+    nh_("~"),
+    action_name_(name)
+  {
+    ROS_INFO_STREAM("Starting Point Cloud node 2");
+
+    // Parameters
+    arm_link = "/base_link";
+    min_cam_dist = 0.15;
+    max_cam_dist = 1.0;
+
+    // Subscribe to point cloud
+    point_cloud_sub_ = nh_.subscribe("/points2", 1, &PointCloud::cloudCallback, this);
+
+    // Publish a point cloud of filtered data that was not part of table
+    depth_pub_ = nh_.advertise< pcl::PointCloud<pcl::PointXYZRGB> >("depth_output", 1);
+  }//end PointCloud
+
+
+  // Proccess the point clouds, called when subscriber gets msg
+  void cloudCallback( const PointCloud::ConstPtr& msg )
+  {
+    ROS_INFO_STREAM("Recieved callback");
+    // Basic point cloud conversions ---------------------------------------------------------------
+    // Convert from ROS to PCL
+    pcl::PointCloud<pcl::PointXYZRGB> cloud;
+    //pcl::fromROSMsg(*msg, cloud);
+    cloud = msg;
+    // Make new point cloud that is in our working frame
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_transformed(new pcl::PointCloud<pcl::PointXYZRGB>);
+
+    // Transform to whatever frame we're working in, probably the arm's base frame, ie "base_link"
+    tf_listener_.waitForTransform(std::string(arm_link), cloud.header.frame_id,
+                                  cloud.header.stamp, ros::Duration(1.0));
+    if(!pcl_ros::transformPointCloud(std::string(arm_link), cloud, *cloud_transformed, tf_listener_))
+    {
+      ROS_ERROR("Error converting to desired frame");
+      return;
+    }
+
+    // Limit to things we think are roughly at the table height ------------------------------------
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filteredZ(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pcl::PassThrough<pcl::PointXYZRGB> pass;
+    pass.setInputCloud(cloud_transformed);
+    pass.setFilterFieldName("z");
+    pass.setFilterLimits(min_cam_dist-.05,max_cam_dist+0.05);
+    pass.filter(*cloud_filteredZ);
+
+
+    // Limit to things in front of the robot ---------------------------------------------------
+    pcl::PointCloud<pcl::PointXYZRGB>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZRGB>);
+    pass.setInputCloud(cloud_filteredZ);
+    pass.setFilterFieldName("x");
+    pass.setFilterLimits(.1,.5);
+    pass.filter(*cloud_filtered);
+
+
+    // Check if any points remain
+    if( cloud_filtered->points.size() == 0 )
+    {
+      ROS_ERROR("0 points left");
+      return;
+    }
+    else
+    {
+      ROS_INFO("[block detection] Filtered, %d points left", (int) cloud_filtered->points.size());
+    }
+
+    pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+    pcl::ModelCoefficients::Ptr coefficients(new pcl::ModelCoefficients);
+
+    int nr_points = cloud_filtered->points.size();
+
+    // Segment cloud until there are less than 30% of points left? not sure why this is necessary
+    pcl::SACSegmentation<pcl::PointXYZRGB> seg;
+    seg.setOptimizeCoefficients(true);
+    seg.setModelType(pcl::SACMODEL_PLANE);
+    seg.setMethodType(pcl::SAC_RANSAC); // robustness estimator - RANSAC is simple
+    seg.setMaxIterations(200);
+    seg.setDistanceThreshold(0.005); // determines how close a point must be to the model in order to be considered an inlier
+    while(cloud_filtered->points.size() > 0.3 * nr_points)
+    {
+      // Segment the largest planar component from the remaining cloud (find the table)
+      seg.setInputCloud(cloud_filtered);
+      seg.segment(*inliers, *coefficients);
+
+      if(inliers->indices.size() == 0)
+      {
+        ROS_ERROR("[block detection] Could not estimate a planar model for the given dataset.");
+        return;
+      }
+
+      // Debug output - DTC
+      // Show the contents of the inlier set, together with the estimated plane parameters, in ax+by+cz+d=0 form (general equation of a plane)
+      std::cerr << "Model coefficients: " << coefficients->values[0] << " "
+                << coefficients->values[1] << " "
+                << coefficients->values[2] << " "
+                << coefficients->values[3] << std::endl;
+    }//end while
+
+    // DTC: Removed to make compatible with PCL 1.5
+    // Creating the KdTree object for the search method of the extraction
+    //pcl::KdTree<pcl::PointXYZRGB>::Ptr tree(new pcl::KdTreeFLANN<pcl::PointXYZRGB>);
+    //tree->setInputCloud(cloud_filtered);
+    // Publish point cloud data
+    depth_pub_.publish(cloud_filtered);
+
+}//end cloudCallBack
+}; //end class
+}; //end namespace
+
+/*----------------------------------------------------------------------------*/
+// New audio sample event handler
+void onNewAudioSample(AudioNode node, AudioNode::NewSampleReceivedData data)
+{
+    //printf("A#%u: %d\n",g_aFrames,data.audioData.size());
+    g_aFrames++;
+}
+
+/*----------------------------------------------------------------------------*/
+// New color sample event handler
+void onNewColorSample(ColorNode node, ColorNode::NewSampleReceivedData data)
+{
+    //printf("C#%u: %d\n",g_cFrames,data.colorMap.size());
+    g_cFrames++;
+}
+
+/*----------------------------------------------------------------------------*/
+// New depth sample event varsace tieshandler
+void onNewDepthSample(DepthNode node, DepthNode::NewSampleReceivedData data)
+{
+    //printf("Z#%u: %d %d %d\n",g_dFrames,data.vertices[500].x,data.vertices[500].y,data.vertices[500].z);
+    int count = 0;
+    msg->header.frame_id = "/base_link";
+    // Project some 3D points in the Color Frame
+    if (!g_pProjHelper)
+    {
+        g_pProjHelper = new ProjectionHelper (data.stereoCameraParameters);
+        g_scp = data.stereoCameraParameters;
+    }
+    else if (g_scp != data.stereoCameraParameters)
+    {
+        g_pProjHelper->setStereoCameraParameters(data.stereoCameraParameters);
+        g_scp = data.stereoCameraParameters;
+    }
+
+    int32_t w, h;
+    FrameFormat_toResolution(data.captureConfiguration.frameFormat,&w,&h);
+    int cx = w/2;
+    int cy = h/2;
+    msg->points.resize(w*h);    
+
+    Vertex p3DPoints[4];
+
+    p3DPoints[0] = data.vertices[(cy-h/4)*w+cx-w/4];
+    p3DPoints[1] = data.vertices[(cy-h/4)*w+cx+w/4];
+    p3DPoints[2] = data.vertices[(cy+h/4)*w+cx+w/4];
+    p3DPoints[3] = data.vertices[(cy+h/4)*w+cx-w/4];
+    
+    Point2D p2DPoints[4];
+    g_pProjHelper->get2DCoordinates ( p3DPoints, p2DPoints, 4, CAMERA_PLANE_COLOR);
+    
+    g_dFrames++;
+   
+    msg->height = h;
+    cloud.height = h;
+    msg->width = w;
+    cloud.width = w;
+    cloud.is_dense = true;
+    cloud.points.resize(w*h); 
+
+    for(int i = 0;i < h;i++){
+	for(int j = 0;j < w; j++){
+	 count++;
+	 msg->points.push_back (pcl::PointXYZ(data.vertices[count].x,data.vertices[count].y,data.vertices[count].z));
+         cloud.points[count].x = data.vertices[count].x;
+	 cloud.points[count].y = data.vertices[count].y;
+         if(data.vertices[count].z == 32001){
+		cloud.points[count].z = 0;
+	 }else{
+	 	cloud.points[count].z = data.vertices[count].z;
+         }
+	 //cloud.points[count].rgb = 0;
+	}
+    }
+    // We now want to create a range image from the above point cloud, with a 1deg angular resolution
+    float angularResolution = (float) (  1.0f * (M_PI/180.0f));  //   1.0 degree in radians
+    float maxAngleWidth     = (float) (360.0f * (M_PI/180.0f));  // 360.0 degree in radians
+    float maxAngleHeight    = (float) (180.0f * (M_PI/180.0f));  // 180.0 degree in radians
+    Eigen::Affine3f sensorPose = (Eigen::Affine3f)Eigen::Translation3f(0.0f, 0.0f, 0.0f);
+    pcl::RangeImage::CoordinateFrame coordinate_frame = pcl::RangeImage::CAMERA_FRAME;
+    float noiseLevel=0.00;
+    float minRange = 0.0f;
+    int borderSize = 0;
+    //pcl::RangeImage rangeImage;
+    //rangeImage.createFromPointCloud(cloud, angularResolution, maxAngleWidth, maxAngleHeight, sensorPose, coordinate_frame, noiseLevel, minRange, borderSize);     
+
+    pub.publish (msg);
+    // Quit the main loop after 200 depth frames received
+    if (g_dFrames%1== 0){
+	pcl::io::savePCDFileASCII("pcdTest.pcd", cloud);
+        g_context.quit();
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+void configureAudioNode()
+{
+    g_anode.newSampleReceivedEvent().connect(&onNewAudioSample);
+
+    AudioNode::Configuration config = g_anode.getConfiguration();
+    config.sampleRate = 44100;
+
+    try 
+    {
+        g_context.requestControl(g_anode,0);
+
+        g_anode.setConfiguration(config);
+        
+        g_anode.setInputMixerLevel(0.5f);
+    }
+    catch (ArgumentException& e)
+    {
+        printf("Argument Exception: %s\n",e.what());
+    }
+    catch (UnauthorizedAccessException& e)
+    {
+        printf("Unauthorized Access Exception: %s\n",e.what());
+    }
+    catch (ConfigurationException& e)
+    {
+        printf("Configuration Exception: %s\n",e.what());
+    }
+    catch (StreamingException& e)
+    {
+        printf("Streaming Exception: %s\n",e.what());
+    }
+    catch (TimeoutException&)
+    {
+        printf("TimeoutException\n");
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+void configureDepthNode()
+{
+    g_dnode.newSampleReceivedEvent().connect(&onNewDepthSample);
+
+    DepthNode::Configuration config = g_dnode.getConfiguration();
+    config.frameFormat = FRAME_FORMAT_QVGA;
+    config.framerate = 25;
+    config.mode = DepthNode::CAMERA_MODE_CLOSE_MODE;
+    config.saturation = true;
+
+    g_dnode.setEnableVertices(true);
+    g_dnode.setEnableDepthMapFloatingPoint(true);
+
+    try 
+    {
+        g_context.requestControl(g_dnode,0);
+
+        g_dnode.setConfiguration(config);
+    }
+    catch (ArgumentException& e)
+    {
+        printf("Argument Exception: %s\n",e.what());
+    }
+    catch (UnauthorizedAccessException& e)
+    {
+        printf("Unauthorized Access Exception: %s\n",e.what());
+    }
+    catch (IOException& e)
+    {
+        printf("IO Exception: %s\n",e.what());
+    }
+    catch (InvalidOperationException& e)
+    {
+        printf("Invalid Operation Exception: %s\n",e.what());
+    }
+    catch (ConfigurationException& e)
+    {
+        printf("Configuration Exception: %s\n",e.what());
+    }
+    catch (StreamingException& e)
+    {
+        printf("Streaming Exception: %s\n",e.what());
+    }
+    catch (TimeoutException&)
+    {
+        printf("TimeoutException\n");
+    }
+
+}
+
+/*----------------------------------------------------------------------------*/
+void configureColorNode()
+{
+    // connect new color sample handler
+    g_cnode.newSampleReceivedEvent().connect(&onNewColorSample);
+
+    ColorNode::Configuration config = g_cnode.getConfiguration();
+    config.frameFormat = FRAME_FORMAT_VGA;
+    config.compression = COMPRESSION_TYPE_MJPEG;
+    config.powerLineFrequency = POWER_LINE_FREQUENCY_50HZ;
+    config.framerate = 25;
+
+    g_cnode.setEnableColorMap(true);
+
+    try 
+    {
+        g_context.requestControl(g_cnode,0);
+
+        g_cnode.setConfiguration(config);
+    }
+    catch (ArgumentException& e)
+    {
+        printf("Argument Exception: %s\n",e.what());
+    }
+    catch (UnauthorizedAccessException& e)
+    {
+        printf("Unauthorized Access Exception: %s\n",e.what());
+    }
+    catch (IOException& e)
+    {
+        printf("IO Exception: %s\n",e.what());
+    }
+    catch (InvalidOperationException& e)
+    {
+        printf("Invalid Operation Exception: %s\n",e.what());
+    }
+    catch (ConfigurationException& e)
+    {
+        printf("Configuration Exception: %s\n",e.what());
+    }
+    catch (StreamingException& e)
+    {
+        printf("Streaming Exception: %s\n",e.what());
+    }
+    catch (TimeoutException&)
+    {
+        printf("TimeoutException\n");
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+void configureNode(Node node)
+{
+    if ((node.is<DepthNode>())&&(!g_dnode.isSet()))
+    {
+        g_dnode = node.as<DepthNode>();
+        configureDepthNode();
+        g_context.registerNode(node);
+    }
+
+    if ((node.is<ColorNode>())&&(!g_cnode.isSet()))
+    {
+        g_cnode = node.as<ColorNode>();
+        configureColorNode();
+        g_context.registerNode(node);
+    }
+
+    if ((node.is<AudioNode>())&&(!g_anode.isSet()))
+    {
+        g_anode = node.as<AudioNode>();
+        configureAudioNode();
+        g_context.registerNode(node);
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+void onNodeConnected(Device device, Device::NodeAddedData data)
+{
+    configureNode(data.node);
+}
+
+/*----------------------------------------------------------------------------*/
+void onNodeDisconnected(Device device, Device::NodeRemovedData data)
+{
+    if (data.node.is<AudioNode>() && (data.node.as<AudioNode>() == g_anode))
+        g_anode.unset();
+    if (data.node.is<ColorNode>() && (data.node.as<ColorNode>() == g_cnode))
+        g_cnode.unset();
+    if (data.node.is<DepthNode>() && (data.node.as<DepthNode>() == g_dnode))
+        g_dnode.unset();
+    printf("Node disconnected\n");
+}
+
+/*----------------------------------------------------------------------------*/
+void onDeviceConnected(Context context, Context::DeviceAddedData data)
+{
+    if (!g_bDeviceFound)
+    {
+        data.device.nodeAddedEvent().connect(&onNodeConnected);
+        data.device.nodeRemovedEvent().connect(&onNodeDisconnected);
+        g_bDeviceFound = true;
+    }
+}
+
+/*----------------------------------------------------------------------------*/
+void onDeviceDisconnected(Context context, Context::DeviceRemovedData data)
+{
+    g_bDeviceFound = false;
+    printf("Device disconnected\n");
+}
+
+/*----------------------------------------------------------------------------*/
+int main(int argc, char* argv[])
+{
+    ros::init (argc, argv, "pub_pcl");
+    ros::NodeHandle nh;
+    pub = nh.advertise<PointCloud> ("points2", 1);
+    point_cloud::PointCloud detector("pcl_class1"); //creates PointCloudLab class object
+  
+    int user_input = 1;
+    g_context = Context::create("localhost");
+
+    g_context.deviceAddedEvent().connect(&onDeviceConnected);
+    g_context.deviceRemovedEvent().connect(&onDeviceDisconnected);
+
+    // Get the list of currently connected devices
+    vector<Device> da = g_context.getDevices();
+
+    // We are only interested in the first device
+    if (da.size() >= 1)
+    {
+        g_bDeviceFound = true;
+
+        da[0].nodeAddedEvent().connect(&onNodeConnected);
+        da[0].nodeRemovedEvent().connect(&onNodeDisconnected);
+
+        vector<Node> na = da[0].getNodes();
+        
+        printf("Found %u nodes\n",na.size());
+        
+        for (int n = 0; n < (int)na.size();n++)
+            configureNode(na[n]);
+    }
+
+    while(user_input==1){
+    	g_context.startNodes();
+
+    	g_context.run();
+
+    	g_context.stopNodes();
+	cout << "Please enter an 1 or 0: ";
+    	cin >> user_input;
+    }
+    if (g_cnode.isSet()) g_context.unregisterNode(g_cnode);
+    if (g_dnode.isSet()) g_context.unregisterNode(g_dnode);
+    if (g_anode.isSet()) g_context.unregisterNode(g_anode);
+
+    if (g_pProjHelper)
+        delete g_pProjHelper;
+
+    return 0;
+}
